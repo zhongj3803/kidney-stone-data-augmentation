@@ -1,188 +1,147 @@
 import itk
 import os
-import itk.itkNotImageFilterPython
 import numpy as np
 import random
+import cv2
+import sys
 
-def read_masks_and_image(binary_mask_path: str, colored_segmentation_path: str, original_image_path: str):
-    """
-    Reads a binary mask, color segmentation mask, and original image using ITK.
-    
-    Parameters:
-        binary_mask_path (str): Path to the binary mask file.
-        color_mask_path (str): Path to the color segmentation mask file.
-        original_image_path (str): Path to the original image file (e.g., PNG).
-    
-    Returns:
-        tuple: A tuple containing the binary mask, color mask, and original image.
-    """
-    # Read the binary mask (scalar image)
-    binary_mask = itk.imread(binary_mask_path, itk.UC)  # Unsigned Char for binary mask
+def read_masks_and_image(binary_mask_path: str, original_image_path: str):
+    binary_mask = itk.imread(binary_mask_path, itk.UC)
+    original_image = itk.imread(original_image_path, itk.RGBPixel[itk.UC])
 
-    # Read the color segmentation mask (RGB image)
-    colored_segmentation = itk.imread(colored_segmentation_path, itk.RGBPixel[itk.UC])  # RGB image
+    return binary_mask, original_image
 
-    # Read the original image (e.g., PNG)
-    original_image = itk.imread(original_image_path, itk.RGBPixel[itk.UC])  # RGB image
+def apply_blur(image, kernel_size=3):
+    if kernel_size % 2 == 0 or kernel_size < 1:
+        raise ValueError("kernel_size must be an odd integer greater than or equal to 1")
 
-    return binary_mask, colored_segmentation, original_image
-
-# WORKS
-def apply_blur(image):
     copy = itk.image_duplicator(image)
-    components = itk.VectorIndexSelectionCastImageFilter.New(copy)
-    blurred_channels = []
-
-    for i in range(3):  # RGB channels
-        components.SetIndex(i)
-        components.Update()
-
-        # Apply Gaussian blurring on each channel
-        channel = components.GetOutput()
-        blur_filter = itk.SmoothingRecursiveGaussianImageFilter.New(channel)
-        blur_filter.SetSigma(2.0)  # Set Gaussian standard deviation
-        blur_filter.Update()
-        blurred_channels.append(blur_filter.GetOutput())
-
-    # Merge blurred channels back into RGB
-    join_filter = itk.ComposeImageFilter.New(*blurred_channels)
-    join_filter.Update()
-
-    # Save the output
-    blurred = join_filter.GetOutput()
-    itk.imwrite(blurred, 'blur.png')
-    return blurred
-
-# WORKS
-def apply_color_jitter(image, brightness_range=(0.5, 1.5), contrast_range=(0.5, 2), saturation_range=(0.5, 2)):
-    # Get the size of the image
     size = image.GetLargestPossibleRegion().GetSize()
     height, width = size[1], size[0]
+    pad = kernel_size // 2
 
-    # Clone the input image to create an output image
-    output_image = itk.image_duplicator(image)
-
-    # Generate random factors
-    brightness_factor = random.uniform(*brightness_range)
-    contrast_factor = random.uniform(*contrast_range)
-    saturation_factor = random.uniform(*saturation_range)
-
-    # Iterate through the image pixels
     for y in range(height):
         for x in range(width):
-            # Get the RGB pixel at the current position
-            rgb_pixel = image.GetPixel([x, y])
-            r, g, b = rgb_pixel
+            r_sum, g_sum, b_sum = 0, 0, 0
+            count = 0
+            for ky in range(-pad, pad + 1):
+                for kx in range(-pad, pad + 1):
+                    ny, nx = y + ky, x + kx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        r, g, b = image.GetPixel([nx, ny])
+                        r_sum += r
+                        g_sum += g
+                        b_sum += b
+                        count += 1
+            r_avg, g_avg, b_avg = int(r_sum / count), int(g_sum / count), int(b_sum / count)
+            copy.SetPixel([x, y], itk.RGBPixel[itk.UC]([r_avg, g_avg, b_avg]))
 
-            # Calculate grayscale value
-            gray = (r + g + b) / 3.0
+    # itk.imwrite(copy, 'blurred.png')
+    return copy
 
-            # Apply brightness adjustment
-            r = r * brightness_factor
-            g = g * brightness_factor
-            b = b * brightness_factor
+def apply_color_jitter(image, brightness=.3, contrast=0, saturation=0, hue=[-20, 20]):
+    copy = itk.image_duplicator(image)
+    size = copy.GetLargestPossibleRegion().GetSize()
+    height, width = size[1], size[0]
 
-            # Apply contrast adjustment
-            r = gray + contrast_factor * (r - gray)
-            g = gray + contrast_factor * (g - gray)
-            b = gray + contrast_factor * (b - gray)
+    brightness_factor = random.uniform(max(0, 1 - brightness), 1 + brightness)
+    contrast_factor = random.uniform(max(0, 1 - contrast), 1 + contrast)
+    saturation_factor = random.uniform(max(0, 1 - saturation), 1 + saturation)
+    hue_adjustment = random.uniform(hue[0], hue[1])
 
-            # Apply saturation adjustment
-            r = gray + saturation_factor * (r - gray)
-            g = gray + saturation_factor * (g - gray)
-            b = gray + saturation_factor * (b - gray)
+    for y in range(height):
+        for x in range(width):
+            r, g, b = copy.GetPixel([x, y])
+            rgb = np.array([r, g, b])
 
-            # Clip values to valid range (0-255 for 8-bit images)
-            r = max(0, min(255, int(r)))
-            g = max(0, min(255, int(g)))
-            b = max(0, min(255, int(b)))
+            # brightness
+            rgb = np.clip(rgb * brightness_factor, 0, 255)
 
-            # Set the adjusted pixel value in the output image
-            output_image.SetPixel([x, y], itk.RGBPixel[itk.UC]([r, g, b]))
+            # contrast
+            midpoint = 128
+            rgb = np.clip((rgb - midpoint) * contrast_factor + midpoint, 0, 255)
 
-    itk.imwrite(output_image, 'jittered.png')
-    return output_image
+            pixel = np.uint8([[[rgb[0], rgb[1], rgb[2]]]])
+            hsv_pixel = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)
+            h, s, v = hsv_pixel[0, 0]
 
-# DOESN'T WORK
-def apply_random_perspective(image, distortion_scale=0.5):
-    # Get image size and spacing
-    size = image.GetLargestPossibleRegion().GetSize()
-    spacing = image.GetSpacing()
+            # saturation
+            s = np.clip(s * saturation_factor, 0, 255).astype(np.uint8)
 
-    # Define source and destination points
-    source_points = [
-        [0, 0],
-        [size[0] - 1, 0],
-        [0, size[1] - 1],
-        [size[0] - 1, size[1] - 1]
-    ]
+            # hue
+            h = (h + hue_adjustment) % 180
 
-    destination_points = []
-    for point in source_points:
-        dest_point = [
-            point[0] + random.uniform(-distortion_scale, distortion_scale) * size[0],
-            point[1] + random.uniform(-distortion_scale, distortion_scale) * size[1],
-        ]
-        destination_points.append(dest_point)
+            adjusted_hsv_pixel = np.uint8([[[h, s, v]]])
+            adjusted_pixel = cv2.cvtColor(adjusted_hsv_pixel, cv2.COLOR_HSV2BGR)
+            rgb = np.array(adjusted_pixel[0, 0])
 
-    # Convert to ITK PointSet
-    point_set_type = itk.PointSet[itk.D, 2]
-    source_point_set = point_set_type.New()
-    destination_point_set = point_set_type.New()
+            r, g, b = rgb
 
-    for i, (source, dest) in enumerate(zip(source_points, destination_points)):
-        source_point = itk.Point[itk.D, 2](source)
-        destination_point = itk.Point[itk.D, 2](dest)
-        source_point_set.SetPoint(i, source_point)
-        destination_point_set.SetPoint(i, destination_point)
+            copy.SetPixel([x, y], itk.RGBPixel[itk.UC]([int(r), int(g), int(b)]))
+    # itk.imwrite(copy, 'jittered.png')
+    return copy
 
-    # Create the perspective transform
-    transform = itk.ThinPlateSplineKernelTransform[itk.D, 2].New()
-    transform.SetSourceLandmarks(source_point_set)
-    transform.SetTargetLandmarks(destination_point_set)
-    transform.ComputeWMatrix()
-
-    # Resample the image with the transform
-    resample_filter = itk.ResampleImageFilter.New(image)
-    resample_filter.SetTransform(transform)
-    resample_filter.SetOutputSpacing(spacing)
-    resample_filter.SetSize(size)
-    resample_filter.SetOutputDirection(image.GetDirection())
-    resample_filter.SetOutputOrigin(image.GetOrigin())
-    resample_filter.Update()
-
-    return resample_filter.GetOutput()
+# num_bits is the number of MSB to keep
+def apply_random_posterize(image, num_bits=4, probability=0.5):
+    # if random.random() > probability:
+    #     print('did not make copy')
+    #     return image
     
-# DOESN'T WORK
-def apply_random_adjust_sharpness(image, min_factor=0.5, max_factor=2.0):
-        # Convert the image to grayscale for sharpening
-        # Randomize the sharpness adjustment factor
-    sharpness_factor = random.uniform(min_factor, max_factor)
+    copy = itk.image_duplicator(image)
 
-    # Convert RGB image to grayscale for edge detection
-    grayscale_image = itk.rgb_to_luminance_image_filter(image)
+    size = image.GetLargestPossibleRegion().GetSize()
+    height, width = size[1], size[0]
+    
+    for y in range(height):
+        for x in range(width):
+            r, g, b = image.GetPixel([x, y])
+            r = (r >> (8 - num_bits)) << (8 - num_bits)
+            g = (g >> (8 - num_bits)) << (8 - num_bits)
+            b = (b >> (8 - num_bits)) << (8 - num_bits)
+            copy.SetPixel([x, y], itk.RGBPixel[itk.UC]([r, g, b]))
+    # itk.imwrite(copy, 'posterized.png')
+    return copy
 
-    # Apply Laplacian filter for edge enhancement
-    laplacian_filter = itk.LaplacianImageFilter.New(Input=grayscale_image)
-    laplacian_filter.Update()
-    laplacian_image = laplacian_filter.GetOutput()
+def apply_random_adjust_sharpness(image, sharpness_factor=2, probability=0.5):
+    # if random.random() > probability:
+    #     print("Sharpness adjustment skipped.")
+    #     return image
 
-    # Convert Laplacian image to RGB for blending
-    laplacian_rgb = itk.cast_image_filter(laplacian_image, ttype=(type(laplacian_image), type(image)))
+    blurred = apply_blur(image, kernel_size=3)
 
-    # Blend the original and sharpness-enhanced image
-    adjust_filter = itk.AddImageFilter.New(image, laplacian_rgb)
-    adjust_filter.SetConstant2(sharpness_factor - 1)
-    adjust_filter.Update()
-    adjusted_image = adjust_filter.GetOutput()
+    size = image.GetLargestPossibleRegion().GetSize()
+    height, width = size[1], size[0]
+    copy = itk.image_duplicator(image)
 
-    return adjusted_image
+    for y in range(height):
+        for x in range(width):
+            r_orig, g_orig, b_orig = image.GetPixel([x, y])
 
-# inverts the given mask
+            r_blur, g_blur, b_blur = blurred.GetPixel([x, y])
+
+            r = np.clip((sharpness_factor * r_orig) - ((sharpness_factor - 1) * r_blur), 0, 255)
+            g = np.clip((sharpness_factor * g_orig) - ((sharpness_factor - 1) * g_blur), 0, 255)
+            b = np.clip((sharpness_factor * b_orig) - ((sharpness_factor - 1) * b_blur), 0, 255)
+
+            copy.SetPixel([x, y], itk.RGBPixel[itk.UC]([int(r), int(g), int(b)]))
+
+    # itk.imwrite(copy, 'adjusted_sharpness.png')
+    return copy
+
+# get the roi given the binary mask
+def get_roi(binary_mask, original_image):
+    roi = itk.image_duplicator(original_image)
+    mask_arr = itk.array_from_image(binary_mask)
+    for i in range(len(mask_arr)):
+        for j in range(len(mask_arr[0])):
+            if mask_arr[i][j] < 127:
+                roi.SetPixel((j, i), itk.RGBPixel[itk.UC]([0, 0, 0]))
+    # itk.imwrite(roi, 'roi.png')
+    return roi
+
+# inverts the binary mask
 def inverse_of_mask(binary_mask):
-    itk.imwrite(binary_mask, 'mask.png')
-    copy = itk.image_duplicator(binary_mask)
-    inverted_arr = itk.array_from_image(copy)
+    inverted_arr = itk.array_from_image(binary_mask)
     for i in range(len(inverted_arr)):
         for j in range(len(inverted_arr[0])):
             if inverted_arr[i][j] > 127:
@@ -190,7 +149,7 @@ def inverse_of_mask(binary_mask):
             else:
                 inverted_arr[i][j] = 255
     inverted_image = itk.image_from_array(inverted_arr)
-    itk.imwrite(inverted_image, 'inverted.png') 
+    # itk.imwrite(inverted_image, 'inverted.png') 
     return inverted_image
 
 # gets the non region of interest
@@ -201,64 +160,47 @@ def get_nonroi(mask_inverse, original_image):
         for j in range(len(inverse_arr[0])):
             if inverse_arr[i][j] == 0:
                 nonroi.SetPixel((j, i), itk.RGBPixel[itk.UC]([0, 0, 0]))
-    itk.imwrite(nonroi, 'nonroi.png')
-    itk.imwrite(original_image, 'original.png')
+    # itk.imwrite(nonroi, 'nonroi.png')
     return nonroi
 
 # combines the augmented roi with the non roi
 def combine(roi_augmented, nonroi):
     combined = itk.image_duplicator(nonroi)
-    # kinda lazy so i hardcoded
-    for i in range(512):
-        for j in range(512):
+    a, b, _ = itk.array_from_image(combined).shape
+    for i in range(a):
+        for j in range(b):
             if nonroi.GetPixel((j, i)) == itk.RGBPixel[itk.UC]([0, 0, 0]):
                 combined.SetPixel((j, i), roi_augmented.GetPixel((j, i)))
-    itk.imwrite(combined, 'combined.png')
+    # itk.imwrite(combined, 'combined.png')
     return combined
-    
 
-# this is the ultimate function that will take the mask, segmentation, and original image to produce the augmented version
-# it does so by determining the non-roi (using the mask) and then combining this with the augmented segmentation
-# it looks weird because the mask does not align with the segmentation
-def apply_augmentations(binary_mask, segmentation, original_image, augmentations):
-    res = itk.image_duplicator(segmentation)
-    # inverse_mask = inverse_of_mask(binary_mask)
-    # nonroi = get_nonroi(inverse_mask, original_image)
-    for augmentation in augmentations:
-        res = augmentation(res)
+def main():
 
-    # combined = combine(res, nonroi)
-    # return combined    
+    # comment any out if you don't want to test them
+    augmentations = [
+        lambda img: apply_blur(img, kernel_size=3),
+        lambda img: apply_color_jitter(img, brightness=0.5, contrast=0.5, saturation=0.5, hue=[-20, 20]),
+        lambda img: apply_random_posterize(img, num_bits=2, probability=1),
+        lambda img: apply_random_adjust_sharpness(img, sharpness_factor=3, probability=0.5)
+    ]
 
+    if len(sys.argv) != 3:
+        print("Usage: python3 augment.py <binary_mask_path> <original_image_path>")
+        sys.exit(1)
 
-# Main Execution
+    binary_mask_path = sys.argv[1]
+    original_image_path = sys.argv[2]
 
-augmentations = [
-    # lambda img: apply_blur(img),
-    # lambda img: apply_color_jitter(img, brightness_range=(0.5, 1.5), contrast_range=(0.5, 2), saturation_range=(0.5, 2)),
-    lambda img: apply_random_perspective(img, distortion_scale=0.5), # TODO
-    # lambda img: apply_random_adjust_sharpness(img, min_factor=0.5, max_factor=2.0)
-]
+    binary_mask, original_image = read_masks_and_image(binary_mask_path, original_image_path)
 
-frame = './data/test/1/VUMC040dust.MP4_frame312/'
-orig = ''
-for file_name in os.listdir(frame):
-    if not (file_name.startswith("mask_") or file_name.startswith("color_")):
-        orig = file_name
-binary_mask_path = frame + 'mask_' + orig
-segmentation_path = frame + 'color_' + orig
-original_image_path = frame + orig
+    roi = get_roi(binary_mask, original_image)
+    nonroi = get_nonroi(inverse_of_mask(binary_mask), original_image)
 
-binary_mask, segmentation, original_image = read_masks_and_image(
-    binary_mask_path, segmentation_path, original_image_path
-)
+    for a in augmentations:
+        roi = a(roi)
 
-# inverse_mask = inverse_of_mask(binary_mask)
-# nonroi = get_nonroi(inverse_mask, original_image)
-# combined = combine(segmentation, nonroi)
+    combined = combine(roi, nonroi)
+    itk.imwrite(combined, 'result.png')
 
-
-augmented = apply_augmentations(binary_mask, segmentation, original_image, augmentations)
-
-# itk.imwrite(original_image, 'original.png')
-# itk.imwrite(augmented, 'augmented.png')
+if __name__ == "__main__":
+    main()
